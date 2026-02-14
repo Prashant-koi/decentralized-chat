@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-func solveChallenge(conn net.Conn, sc *bufio.Scanner, pub ed25519.PublicKey, priv ed25519.PrivateKey) error {
+func solveChallenge(conn net.Conn, sc *bufio.Scanner, pub ed25519.PublicKey, priv ed25519.PrivateKey, handle string) error {
 	/*
 		since the server sends the client a challenge to find out if the client has the correct public key and
 		they are who they say they are, we have to solve the challenge and send them back an "hello" message
@@ -37,6 +37,7 @@ func solveChallenge(conn net.Conn, sc *bufio.Scanner, pub ed25519.PublicKey, pri
 		Type:   "hello",
 		PubKey: base64.StdEncoding.EncodeToString(pub),
 		Sig:    base64.StdEncoding.EncodeToString(sig),
+		Handle: handle,
 	}
 
 	b, _ := json.Marshal(hello)
@@ -65,6 +66,12 @@ func Run(addr string) error {
 		return err
 	}
 
+	//ask the user for handel before opening a connection
+	handle, err := askHandle()
+	if err != nil {
+		return err
+	}
+
 	//open a network connection using tcp to server address
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -81,7 +88,7 @@ func Run(addr string) error {
 	}
 
 	// when server first makes connection it sends challenege and this function runs to solve that challenge
-	if err := solveChallenge(conn, sc, pub, priv); err != nil {
+	if err := solveChallenge(conn, sc, pub, priv, handle); err != nil {
 		return err
 	}
 
@@ -195,4 +202,23 @@ func parseCommand(line string) (to string, text string, ok bool) {
 
 	fmt.Println("unknown command, use /all, /to, /who")
 	return "", "", false
+}
+
+func askHandle() (string, error) {
+	/*
+		this function is gonna ask the user for the handle to make comminication easier for the user
+		we need to ask it before opening the network connection in the Run() function
+	*/
+
+	fmt.Print("Choose a handle: ")
+	in := bufio.NewScanner(os.Stdin)
+	if !in.Scan() {
+		return "", fmt.Errorf("no input")
+	}
+	h := strings.TrimSpace(in.Text())
+	if h == "" {
+		return "", fmt.Errorf("handle can't be empty")
+	}
+
+	return h, nil
 }

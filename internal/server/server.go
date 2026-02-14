@@ -13,17 +13,19 @@ import (
 )
 
 type Client struct {
-	pub  string
-	conn net.Conn
-	send chan []byte
+	pub    string
+	handle string
+	conn   net.Conn
+	send   chan []byte
 }
 
 var (
 	mu      sync.Mutex
 	clients = map[string]*Client{}
+	handle  = map[string]string{}
 )
 
-func addClient(c *Client) bool {
+func addClient(c *Client) error {
 	/*
 		return false if a client that is already connected is
 		trying to connect else true
@@ -32,16 +34,26 @@ func addClient(c *Client) bool {
 	defer mu.Unlock()
 
 	if _, exists := clients[c.pub]; exists {
-		return false
+		return fmt.Errorf("pubkey already exists")
+	}
+
+	if _, exists := handle[c.handle]; exists {
+		return fmt.Errorf("handle already taken")
 	}
 
 	clients[c.pub] = c
-	return true
+	handle[c.handle] = c.pub
+	return nil
 }
 
 func removeClient(pub string) {
 	mu.Lock()
 	defer mu.Unlock()
+
+	if c, ok := clients[pub]; ok {
+		delete(handle, c.handle)
+	}
+
 	delete(clients, pub)
 }
 
@@ -52,12 +64,13 @@ func getClient(pub string) (*Client, bool) {
 	return c, ok
 }
 
-func listClient() []string {
+func listHandles() []string {
 	mu.Lock()
 	defer mu.Unlock()
-	out := make([]string, 0, len(clients))
-	for pub := range clients {
-		out = append(out, pub)
+	out := make([]string, 0, len(handle))
+	for h := range handle {
+		out = append(out, h)
+		out = append(out, ",")
 	}
 	return out
 }
@@ -140,11 +153,25 @@ func clientAuth(c *Client, sc *bufio.Scanner) (protocol.Msg, error) {
 
 	if !ed25519.Verify(ed25519.PublicKey(pubBytes), nonce, sigBytes) {
 		sendJSON(c, protocol.Msg{Type: "error", Text: "Signature not verified"})
-		return protocol.Msg{}, err
+		return protocol.Msg{}, fmt.Errorf("signature verification failed")
 	}
 
 	return hello, nil
 
+}
+
+func resolveToPub(to string) string {
+	/*
+		this function resolved handle to the publick key while sending a message
+	*/
+	mu.Lock()
+	defer mu.Unlock()
+
+	if pub, ok := handle[to]; ok {
+		return pub
+	}
+
+	return to //we will allow raw public key too
 }
 
 // HandleConn manages a single client lifecycle.
@@ -173,9 +200,14 @@ func HandleConn(conn net.Conn) {
 	}
 
 	c.pub = hello.PubKey
+	c.handle = hello.Handle
+	if c.handle == "" {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "handle required"})
+		return
+	}
 
-	if !addClient(c) {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "pubkey already connected"})
+	if err := addClient(c); err != nil {
+		sendJSON(c, protocol.Msg{Type: "error", Text: err.Error()})
 		return
 	}
 
@@ -184,7 +216,7 @@ func HandleConn(conn net.Conn) {
 	//welcome message and join message
 	sendJSON(c, protocol.Msg{Type: "welcome", ID: c.pub, Text: "Use /all <msg> or /to <id> <msg> or /who"})
 
-	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s joined", c.pub)})
+	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s joined", c.handle)})
 
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -202,13 +234,14 @@ func HandleConn(conn net.Conn) {
 
 		text := m.Text
 		if text == "/who" {
-			sendJSON(c, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("online: %v", listClient())})
+			sendJSON(c, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("online: %v", listHandles())})
 			continue
 		}
 
 		//route
 		if m.To != "" {
-			target, ok := getClient(m.To)
+			toPub := resolveToPub(m.To)
+			target, ok := getClient(toPub)
 			if !ok {
 				sendJSON(c, protocol.Msg{Type: "error", Text: "no such client"})
 				continue

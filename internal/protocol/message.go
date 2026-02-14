@@ -6,6 +6,7 @@ type Msg struct {
 	PubKey string `json:"pubkey,omitempty"`
 	Nonce  string `json:"nonce,omitempty"` //base64 random nonce
 	Sig    string `json:"sig,omitempty"`
+	Handle string `json:"handle,omitempty"` //username handle for client an abstraction of Pubkey if you may
 
 	// Routing
 	To   string `json:"to,omitempty"`
