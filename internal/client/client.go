@@ -2,24 +2,73 @@ package client
 
 import (
 	"bufio"
+	"chat/internal/crypto"
+	"chat/internal/protocol"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"strings"
-
-	"chat/internal/protocol"
 )
 
+func solveChallenge(conn net.Conn, sc *bufio.Scanner, pub ed25519.PublicKey, priv ed25519.PrivateKey) error {
+
+	var ch protocol.Msg
+	if err := json.Unmarshal(sc.Bytes(), &ch); err != nil || ch.Type != "challenge" || ch.Nonce == "" {
+		return fmt.Errorf("bad challenge from server")
+	}
+
+	nonce, err := base64.StdEncoding.DecodeString(ch.Nonce)
+	if err != nil {
+		return fmt.Errorf("bad nonce")
+	}
+
+	sig := ed25519.Sign(priv, nonce)
+
+	hello := protocol.Msg{
+		Type:   "hello",
+		PubKey: base64.StdEncoding.EncodeToString(pub),
+		Sig:    base64.StdEncoding.EncodeToString(sig),
+	}
+
+	b, _ := json.Marshal(hello)
+	b = append(b, '\n')
+
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	return nil
+}
+
 func Run(addr string) error {
+	path := os.Getenv("CHAT_ID_FILE")
+	if path == "" {
+		path = "./id.key"
+	}
+	pub, priv, err := crypto.LoadOrCreateIdentity(path)
+
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
+
 	defer conn.Close()
 
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+
+	if !sc.Scan() {
+		return fmt.Errorf("Server disconnected")
+	}
+
+	if err := solveChallenge(conn, sc, pub, priv); err != nil {
+		return err
+	}
+
 	// read server messages
-	go readLoop(conn)
+	go readLoop(sc)
 
 	printHelp()
 
@@ -46,8 +95,7 @@ func Run(addr string) error {
 	}
 }
 
-func readLoop(conn net.Conn) {
-	sc := bufio.NewScanner(conn)
+func readLoop(sc *bufio.Scanner) {
 	for sc.Scan() {
 		var m protocol.Msg
 		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {

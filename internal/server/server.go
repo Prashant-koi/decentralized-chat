@@ -2,53 +2,53 @@ package server
 
 import (
 	"bufio"
+	"chat/internal/protocol"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
-
-	"chat/internal/protocol"
 )
 
 type Client struct {
-	id   string
+	pub  string
 	conn net.Conn
 	send chan []byte
 }
 
 var (
 	mu      sync.Mutex
-	nextID  int
 	clients = map[string]*Client{}
 )
 
-// the server will create an unique client ID right now
-// for communication
-// reminder this implementation will probably chance later since
-// we are going decentralized
-func newClientID() string {
+func addClient(c *Client) bool {
+	/*
+		return false if a client that is already connected is
+		trying to connect else true
+	*/
 	mu.Lock()
 	defer mu.Unlock()
-	nextID++
-	return fmt.Sprintf("c%d", nextID)
+
+	if _, exists := clients[c.pub]; exists {
+		return false
+	}
+
+	clients[c.pub] = c
+	return true
 }
 
-func addClient(c *Client) {
+func removeClient(pub string) {
 	mu.Lock()
 	defer mu.Unlock()
-	clients[c.id] = c
+	delete(clients, pub)
 }
 
-func removeClient(id string) {
+func getClient(pub string) (*Client, bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	delete(clients, id)
-}
-
-func getClient(id string) (*Client, bool) {
-	mu.Lock()
-	defer mu.Unlock()
-	c, ok := clients[id]
+	c, ok := clients[pub]
 	return c, ok
 }
 
@@ -56,8 +56,8 @@ func listClient() []string {
 	mu.Lock()
 	defer mu.Unlock()
 	out := make([]string, 0, len(clients))
-	for id := range clients {
-		out = append(out, id)
+	for pub := range clients {
+		out = append(out, pub)
 	}
 	return out
 }
@@ -95,26 +95,97 @@ func broadcast(fromID string, m protocol.Msg) {
 	}
 }
 
+func clientAuth(c *Client, sc *bufio.Scanner) (protocol.Msg, error) {
+	/*
+		We need to make sure that the client is the one with the public key
+		that is why we send a little challenge to the client expecting a hello
+		with pubkey and signature and we crossvalidate those and then verify the
+		signature at last after that in the handleConn function we proceed as normal
+	*/
+
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return protocol.Msg{}, err
+	}
+
+	nonceb64 := base64.StdEncoding.EncodeToString(nonce)
+	sendJSON(c, protocol.Msg{Type: "challenge", Nonce: nonceb64})
+
+	if !sc.Scan() {
+		return protocol.Msg{}, fmt.Errorf("scan failed")
+	}
+
+	var hello protocol.Msg
+	if err := json.Unmarshal(sc.Bytes(), &hello); err != nil {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "bad JSON"})
+		return protocol.Msg{}, err
+	}
+
+	if hello.Type != "hello" || hello.PubKey == "" || hello.Sig == "" {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "expected hello, didn't get"})
+		return protocol.Msg{}, fmt.Errorf("didn't get hello")
+	}
+
+	pubBytes, err := base64.StdEncoding.DecodeString(hello.PubKey)
+	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "Bad public key"})
+		return protocol.Msg{}, err
+	}
+
+	sigBytes, err := base64.StdEncoding.DecodeString(hello.Sig)
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "Bad Signature"})
+		return protocol.Msg{}, err
+	}
+
+	if !ed25519.Verify(ed25519.PublicKey(pubBytes), nonce, sigBytes) {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "Signature not verified"})
+		return protocol.Msg{}, err
+	}
+
+	return hello, nil
+
+}
+
 // HandleConn manages a single client lifecycle.
 func HandleConn(conn net.Conn) {
+	/*
+		first verify the client is actually the one who they say they are and
+		then proceed normally
+	*/
 	defer conn.Close()
 
 	c := &Client{
-		id:   newClientID(),
+		pub:  "",
 		conn: conn,
 		send: make(chan []byte, 32),
 	}
-	addClient(c)
-	defer removeClient(c.id)
 
 	go writeLoop(c)
+	defer close(c.send)
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+
+	hello, err := clientAuth(c, sc)
+	if err != nil {
+		sendJSON(c, protocol.Msg{Type: "error", Text: err.Error()})
+		return
+	}
+
+	c.pub = hello.PubKey
+
+	if !addClient(c) {
+		sendJSON(c, protocol.Msg{Type: "error", Text: "pubkey already connected"})
+		return
+	}
+
+	defer removeClient(c.pub)
 
 	//welcome message and join message
-	sendJSON(c, protocol.Msg{Type: "welcome", ID: c.id, Text: "Use /all <msg> or /to <id> <msg> or /who"})
+	sendJSON(c, protocol.Msg{Type: "welcome", ID: c.pub, Text: "Use /all <msg> or /to <id> <msg> or /who"})
 
-	broadcast(c.id, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s joined", c.id)})
+	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s joined", c.pub)})
 
-	sc := bufio.NewScanner(conn)
 	for sc.Scan() {
 		line := sc.Bytes()
 
@@ -142,12 +213,12 @@ func HandleConn(conn net.Conn) {
 				sendJSON(c, protocol.Msg{Type: "error", Text: "no such client"})
 				continue
 			}
-			sendJSON(target, protocol.Msg{Type: "msg", From: c.id, Text: text})
+			sendJSON(target, protocol.Msg{Type: "msg", From: c.pub, Text: text})
 		} else {
-			broadcast(c.id, protocol.Msg{Type: "msg", From: c.id, Text: text})
+			broadcast(c.pub, protocol.Msg{Type: "msg", From: c.pub, Text: text})
 		}
 	}
 
 	//announce leave
-	broadcast(c.id, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s left", c.id)})
+	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s left", c.pub)})
 }

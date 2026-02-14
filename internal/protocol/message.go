@@ -3,7 +3,7 @@ package protocol
 type Msg struct {
 	Type string `json:"type"`
 	//Identity
-	Pubkey string `json:"pubkey,omitempty"`
+	PubKey string `json:"pubkey,omitempty"`
 	Nonce  string `json:"nonce,omitempty"` //base64 random nonce
 	Sig    string `json:"sig,omitempty"`
 
