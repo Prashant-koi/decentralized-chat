@@ -13,4 +13,7 @@ type Msg struct {
 	From string `json:"from,omitempty"`
 	Text string `json:"text,omitempty"`
 	ID   string `json:"id,omitempty"`
+
+	// Who response
+	Peers []Msg `json:"peers,omitempty"`
 }

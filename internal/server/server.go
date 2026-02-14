@@ -234,7 +234,14 @@ func HandleConn(conn net.Conn) {
 
 		text := m.Text
 		if text == "/who" {
-			sendJSON(c, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("online: %v", listHandles())})
+			mu.Lock()
+			peers := make([]protocol.Msg, 0, len(clients))
+			for _, cc := range clients {
+				peers = append(peers, protocol.Msg{Handle: cc.handle, PubKey: cc.pub})
+			}
+			mu.Unlock()
+
+			sendJSON(c, protocol.Msg{Type: "who_resp", Peers: peers})
 			continue
 		}
 
@@ -246,9 +253,9 @@ func HandleConn(conn net.Conn) {
 				sendJSON(c, protocol.Msg{Type: "error", Text: "no such client"})
 				continue
 			}
-			sendJSON(target, protocol.Msg{Type: "msg", From: c.pub, Text: text})
+			sendJSON(target, protocol.Msg{Type: "msg", From: c.handle, Text: text})
 		} else {
-			broadcast(c.pub, protocol.Msg{Type: "msg", From: c.pub, Text: text})
+			broadcast(c.pub, protocol.Msg{Type: "msg", From: c.handle, Text: text})
 		}
 	}
 
