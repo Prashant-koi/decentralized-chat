@@ -47,6 +47,10 @@ func Run(addr, profile string) error {
 		return err
 	}
 
+	//whoCache is gonna be out temporary in memory directory of who is currently online and what pub key they claim
+	//without this we could message users blindly
+	whoCache := make(map[string]string)
+
 	//open a network connection using tcp to server address
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -68,18 +72,18 @@ func Run(addr, profile string) error {
 	}
 
 	// read server messages
-	go readLoop(sc, contactsPath, contacts)
+	go readLoop(sc, contactsPath, contacts, whoCache)
 
 	// all commands
 	printHelp()
 
-	in := bufio.NewScanner(os.Stdin) //reads our keyboard input
-	writeLoop(in, conn)              //this function will send whtever we write to the server if it is legal
+	in := bufio.NewScanner(os.Stdin)                      //reads our keyboard input
+	writeLoop(in, conn, contactsPath, contacts, whoCache) //this function will send whtever we write to the server if it is legal
 
 	return nil
 }
 
-func writeLoop(in *bufio.Scanner, conn net.Conn) error {
+func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string) error {
 	for { // infinite for loop unless input stops, network error of function returns
 		fmt.Print("> ")
 		if !in.Scan() {
@@ -88,9 +92,48 @@ func writeLoop(in *bufio.Scanner, conn net.Conn) error {
 
 		// we get the user line and if parsing succeeds we move ahead in the code
 		// if parsing doesn't suceed we go to the next loop and ask again
-		to, text, ok := parseCommand(strings.TrimSpace(in.Text()))
+		toHandle, text, ok := parseCommand(strings.TrimSpace(in.Text()))
 		if !ok {
 			continue
+		}
+
+		//if this is a DM(/to [Name]), enforce TOFU and rewrite To to pubkey
+		to := toHandle
+		if toHandle != "" {
+
+			//the line below checks if the client I am trying to sends msg to is online or not
+			//by checking it in the whoCache, while the server already does this right now, we need this
+			//for the fututre
+			pub, exists := whoCache[toHandle]
+			if !exists {
+				//just a little fallback so we don't have to use
+				// /who everytime this only works while the server is
+				// there tho so might need to fix this later
+				if pinned, ok := contacts[toHandle]; ok {
+					pub = pinned
+				} else {
+					fmt.Println("[error] unknow handle. Run /who first.")
+					continue
+				}
+			}
+
+			allowed, msg := tofuObserve(contacts, toHandle, pub)
+			if msg != "" && msg != "unchanged" {
+				fmt.Println(msg)
+			}
+
+			if !allowed {
+				fmt.Println("[blocked] key mismatch")
+				continue
+			}
+
+			//save on first sight
+			if err := saveContacts(contactsPath, contacts); err != nil {
+				fmt.Println("failed to save contacts: ", err)
+			}
+
+			//we do this because we are sendign to public key not handle
+			to = pub
 		}
 
 		// we create a message struct, Marshal converts it to JSON and then we add a new lin
@@ -108,7 +151,7 @@ func writeLoop(in *bufio.Scanner, conn net.Conn) error {
 
 }
 
-func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string) {
+func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string, whoCache map[string]string) {
 	/*
 		function that reads the stuff the server sends(what other client sends) and use the same connection as in Run() function
 	*/
@@ -128,6 +171,8 @@ func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string
 			fmt.Printf("[%s] %s\n", m.From, m.Text)
 		case "who_resp":
 			for _, p := range m.Peers {
+				whoCache[p.Handle] = p.PubKey //add the online client with to whoCache
+
 				allowed, msg := tofuObserve(contacts, p.Handle, p.PubKey)
 				if msg != "" {
 					fmt.Println(msg)
