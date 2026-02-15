@@ -4,123 +4,12 @@ import (
 	"bufio"
 	"chat/internal/crypto"
 	"chat/internal/protocol"
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 )
-
-func solveChallenge(conn net.Conn, sc *bufio.Scanner, pub ed25519.PublicKey, priv ed25519.PrivateKey, handle string) error {
-	/*
-		since the server sends the client a challenge to find out if the client has the correct public key and
-		they are who they say they are, we have to solve the challenge and send them back an "hello" message
-		for this function we take the existing connection from Run() function to not create a dreadlock
-		and the we also get our stored public key and private key for cross referencing and sending the
-		public key and signature to the server for it to authenticate. NEVER send Private Key to the server
-	*/
-	var ch protocol.Msg
-	if err := json.Unmarshal(sc.Bytes(), &ch); err != nil || ch.Type != "challenge" || ch.Nonce == "" {
-		return fmt.Errorf("bad challenge from server")
-	}
-
-	nonce, err := base64.StdEncoding.DecodeString(ch.Nonce)
-	if err != nil {
-		return fmt.Errorf("bad nonce")
-	}
-
-	sig := ed25519.Sign(priv, nonce)
-
-	hello := protocol.Msg{
-		Type:   "hello",
-		PubKey: base64.StdEncoding.EncodeToString(pub),
-		Sig:    base64.StdEncoding.EncodeToString(sig),
-		Handle: handle,
-	}
-
-	b, _ := json.Marshal(hello)
-	b = append(b, '\n')
-
-	if _, err := conn.Write(b); err != nil {
-		return err
-	}
-	return nil
-}
-
-func loadContacts(path string) (map[string]string, error) {
-	/*
-		this function will load contacts for Trust on First Use(TOFU)
-		from contacts.json
-	*/
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]string), nil // this runs when you have no contacts save aka the first run
-		}
-		return nil, err
-	}
-
-	var contacts map[string]string
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &contacts); err != nil {
-			return nil, err
-		}
-	}
-
-	if contacts == nil {
-		contacts = make(map[string]string) //incase contacts are empty
-	}
-
-	return contacts, nil
-}
-
-func saveContacts(path string, contacts map[string]string) error {
-	// saves new contacts to the contacts.json file
-	data, err := json.MarshalIndent(contacts, "", " ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-func fingerprintPubKey(pubB64 string) string {
-	// creates a short identifier for human for the pub key
-	pubBytes, err := base64.StdEncoding.DecodeString(pubB64)
-	if err != nil {
-		return "invalid-pubkey"
-	}
-
-	sum := sha256.Sum256(pubBytes)
-	return hex.EncodeToString(sum[:8])
-}
-
-func tofuObserve(contacts map[string]string, handle, pubB64 string) (bool, string) {
-	// this pins the handle to pubkey on the first sight
-	// returns allowed, message so if allowed = true ok to talk and if allowed = false
-	// not okay to talk
-	if handle == "" || pubB64 == "" {
-		return false, "missing handle or pubkey"
-	}
-
-	old, exists := contacts[handle]
-	if !exists {
-		contacts[handle] = pubB64
-		return true, fmt.Sprintf("[TOFU] pinned %s to %s", handle, fingerprintPubKey(pubB64))
-	}
-
-	if old == pubB64 {
-		return true, "unchanged"
-	}
-
-	//incase of mismatch (potentially unsafe)
-	return false, fmt.Sprintf("[WARNING] %s changed keys! old= %s new= %s", handle, fingerprintPubKey(old), fingerprintPubKey(pubB64))
-
-}
 
 func Run(addr, profile string) error {
 	/*
@@ -258,15 +147,6 @@ func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string
 	os.Exit(0)
 }
 
-func printHelp() {
-	//function which prints all commands avilable to user
-	fmt.Println("Commands:")
-	fmt.Println("  /all <msg>           broadcast")
-	fmt.Println("  /to <id> <msg>       send to one user")
-	fmt.Println("  /who                 list online")
-	fmt.Println()
-}
-
 func parseCommand(line string) (to string, text string, ok bool) {
 	/*
 		this function parses the input user inters input scanner in the Run() function
@@ -298,23 +178,4 @@ func parseCommand(line string) (to string, text string, ok bool) {
 
 	fmt.Println("unknown command, use /all, /to, /who")
 	return "", "", false
-}
-
-func askHandle() (string, error) {
-	/*
-		this function is gonna ask the user for the handle to make comminication easier for the user
-		we need to ask it before opening the network connection in the Run() function
-	*/
-
-	fmt.Print("Choose a handle: ")
-	in := bufio.NewScanner(os.Stdin)
-	if !in.Scan() {
-		return "", fmt.Errorf("no input")
-	}
-	h := strings.TrimSpace(in.Text())
-	if h == "" {
-		return "", fmt.Errorf("handle can't be empty")
-	}
-
-	return h, nil
 }
