@@ -2,12 +2,14 @@ package client
 
 import (
 	"crypto/ed25519"
-	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"io"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 type SessionState int
@@ -96,12 +98,16 @@ func (s *Session) startHandshake() error {
 	return nil
 }
 
+// completeHandshake methods calls the deriveSessionKeys function to derive the shared
+// symmetic keys from ephemeral key meterial, assignigng them based on who initiated the handshake
 func (s *Session) completeHandshake(peerPub []byte, initiator bool) error {
 	send, recv, err := deriveSessionKeys(s.MyEphPriv, peerPub)
 	if err != nil {
-		return nil
+		return err
 	}
 
+	// the initiator is to check who initiated the handshake
+	// the same sure both sides dervuve send, recv in the same order
 	if initiator {
 		s.SendKey = send
 		s.RecvKey = recv
@@ -113,4 +119,22 @@ func (s *Session) completeHandshake(peerPub []byte, initiator bool) error {
 	s.PeerEphPub = peerPub
 	s.State = SessReady
 	return nil
+}
+
+// encrypt function basically encrypts the message in the sender side before sending
+// it to the reciever
+func encrypt(key []byte, ctr uint64, msg []byte) ([]byte, error) {
+	aead, _ := chacha20poly1305.New(key)
+	nonce := make([]byte, 12)
+	binary.BigEndian.PutUint64(nonce[4:], ctr)
+	return aead.Seal(nil, nonce, msg, nil), nil
+}
+
+// decrypt function basically decrypts the message in the reciever side when they
+// receive the message
+func decrypt(key []byte, ctr uint64, ct []byte) ([]byte, error) {
+	aead, _ := chacha20poly1305.New(key)
+	nonce := make([]byte, 12)
+	binary.BigEndian.PutUint64(nonce[4:], ctr)
+	return aead.Open(nil, nonce, ct, nil)
 }
