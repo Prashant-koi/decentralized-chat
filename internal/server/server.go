@@ -227,7 +227,10 @@ func HandleConn(conn net.Conn) {
 			continue
 		}
 
-		if m.Type != "send" {
+		switch m.Type {
+		case "send", "hs1", "hs2", "ct":
+			//allowed
+		default:
 			sendJSON(c, protocol.Msg{Type: "error", Text: "unknown type"})
 			continue
 		}
@@ -253,7 +256,8 @@ func HandleConn(conn net.Conn) {
 				sendJSON(c, protocol.Msg{Type: "error", Text: "no such client"})
 				continue
 			}
-			sendJSON(target, protocol.Msg{Type: "msg", From: c.handle, Text: text})
+			m.From = c.pub
+			sendJSON(target, m)
 		} else {
 			broadcast(c.pub, protocol.Msg{Type: "msg", From: c.handle, Text: text})
 		}
