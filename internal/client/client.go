@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"chat/internal/crypto"
 	"chat/internal/protocol"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -51,6 +52,9 @@ func Run(addr, profile string) error {
 	//without this we could message users blindly
 	whoCache := make(map[string]string)
 
+	// shared per-peer E2E sessions (used by both goroutines)
+	sessions := make(map[string]*Session)
+
 	//open a network connection using tcp to server address
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -72,18 +76,18 @@ func Run(addr, profile string) error {
 	}
 
 	// read server messages
-	go readLoop(sc, contactsPath, contacts, whoCache)
+	go readLoop(sc, conn, contactsPath, contacts, whoCache, sessions)
 
 	// all commands
 	printHelp()
 
 	in := bufio.NewScanner(os.Stdin)                      //reads our keyboard input
-	writeLoop(in, conn, contactsPath, contacts, whoCache) //this function will send whtever we write to the server if it is legal
+	writeLoop(in, conn, contactsPath, contacts, whoCache, sessions) //this function will send whtever we write to the server if it is legal
 
 	return nil
 }
 
-func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string) error {
+func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string, sessions map[string]*Session) error {
 	for { // infinite for loop unless input stops, network error of function returns
 		fmt.Print("> ")
 		if !in.Scan() {
@@ -133,7 +137,47 @@ func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts m
 			}
 
 			//we do this because we are sendign to public key not handle
-			to = pub
+			//sending the message
+			sess, ok := sessions[to]
+			if !ok {
+				sess = newSession()
+				sessions[to] = sess
+			}
+
+			//starting the handshake if not doen already
+			if sess.State == SessNone {
+				sess.startHandshake()
+
+				//sending the handshake message to the client
+				hm := protocol.Msg{
+					Type:   "handshake",
+					To:     to,
+					PubKey: base64.StdEncoding.EncodeToString(sess.MyEphPub),
+				}
+
+				b, _ := json.Marshal(hm)
+
+				b = append(b, '\n')
+				conn.Write(b)
+
+				sess.Outbox = append(sess.Outbox, text)
+				continue
+			}
+
+			if sess.State != SessReady {
+				sess.Outbox = append(sess.Outbox, text)
+				continue
+			}
+
+			//we will encrypt the message now
+			ct, err := encrypt(sess.SendKey, sess.SendCtr, []byte(text))
+			if err != nil {
+				fmt.Println("encrypt failed")
+				continue
+			}
+			sess.SendCtr++
+
+			text = base64.StdEncoding.EncodeToString(ct)
 		}
 
 		// we create a message struct, Marshal converts it to JSON and then we add a new lin
@@ -151,7 +195,7 @@ func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts m
 
 }
 
-func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string, whoCache map[string]string) {
+func readLoop(sc *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string, sessions map[string]*Session) {
 	/*
 		function that reads the stuff the server sends(what other client sends) and use the same connection as in Run() function
 	*/
@@ -168,7 +212,21 @@ func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string
 			fmt.Printf("[server] your id: %s\n", m.ID)
 			fmt.Printf("[server] %s\n", m.Text)
 		case "msg": // display message from normal user/other client
-			fmt.Printf("[%s] %s\n", m.From, m.Text)
+			sess, ok := sessions[m.From]
+			if !ok || sess.State != SessReady {
+				fmt.Println("[warning] there is a encrypted messaged but there is no session")
+				continue
+			}
+
+			ct, _ := base64.StdEncoding.DecodeString(m.Text)
+			pt, err := decrypt(sess.RecvKey, sess.RecvCtr, ct)
+			if err != nil {
+				fmt.Println("[decryption failed]")
+				continue
+			}
+			sess.RecvCtr++
+
+			fmt.Printf("[%s] %s\n", m.From, string(pt))
 		case "who_resp":
 			for _, p := range m.Peers {
 				whoCache[p.Handle] = p.PubKey //add the online client with to whoCache
@@ -181,6 +239,52 @@ func readLoop(sc *bufio.Scanner, contactsPath string, contacts map[string]string
 					saveContacts(contactsPath, contacts)
 				}
 			}
+		case "handshake":
+			peerPub, _ := base64.StdEncoding.DecodeString(m.PubKey)
+
+			sess, ok := sessions[m.From]
+			if !ok {
+				sess = newSession()
+				sessions[m.From] = sess
+			}
+
+			// Track whether we just created responder state.
+			responderStarted := false
+
+			//we will reply if we didn't initiate
+			if sess.State == SessNone {
+				sess.startHandshake()
+				responderStarted = true
+
+				reply := protocol.Msg{
+					Type:   "handshake",
+					To:     m.From,
+					PubKey: base64.StdEncoding.EncodeToString(sess.MyEphPub),
+				}
+				b, _ := json.Marshal(reply)
+				b = append(b, '\n')
+				conn.Write(b)
+			}
+
+			// initiator iff we were already waiting before this inbound handshake
+			initiator := !responderStarted && sess.State == SessWaiting
+			sess.completeHandshake(peerPub, initiator)
+
+			//we will flush queued messages now
+			for _, msg := range sess.Outbox {
+				ct, _ := encrypt(sess.SendKey, sess.SendCtr, []byte(msg))
+				sess.SendCtr++
+
+				send := protocol.Msg{
+					Type: "send",
+					To:   m.From,
+					Text: base64.StdEncoding.EncodeToString(ct),
+				}
+				b, _ := json.Marshal(send)
+				b = append(b, '\n')
+				conn.Write(b)
+			}
+			sess.Outbox = nil
 		case "error": // if there is any error that was returned
 			fmt.Printf("[error] %s\n", m.Text)
 		default:

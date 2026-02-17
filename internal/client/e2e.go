@@ -1,10 +1,10 @@
 package client
 
 import (
-	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -57,6 +57,10 @@ func deriveSessionKeys(myPriv, peerPub []byte) (sendKey, recvKey []byte, err err
 	// Perform X25519 Diffie–Hellman key exchange to compute the shared secret.
 	// Both peers independently compute the same shared value using their
 	// private key and the other party's public key.
+	if len(myPriv) != 32 || len(peerPub) != 32 {
+		return nil, nil, fmt.Errorf("invalid x25519 key length")
+	}
+
 	shared, err := curve25519.X25519(myPriv, peerPub)
 	if err != nil {
 		return nil, nil, err
@@ -73,10 +77,12 @@ func deriveSessionKeys(myPriv, peerPub []byte) (sendKey, recvKey []byte, err err
 
 	// Split the output key material into directional session keys.
 	// The first half is used for sending, the second for receiving.
-	sendKey = okm[:32]
-	recvKey = okm[:32]
+	sendKey = make([]byte, 32)
+	recvKey = make([]byte, 32)
+	copy(sendKey, okm[:32])
+	copy(recvKey, okm[32:64])
 
-	return
+	return sendKey, recvKey, nil
 }
 
 // startHandshake method initializes a session's cryptographic handshake by generating a
@@ -87,13 +93,18 @@ func (s *Session) startHandshake() error {
 		return nil
 	}
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv := make([]byte, 32)
+	if _, err := rand.Read(priv); err != nil {
+		return err
+	}
+
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
 	if err != nil {
 		return err
 	}
 
-	s.MyEphPriv = priv.Seed()
-	s.MyEphPub = pub[:32]
+	s.MyEphPriv = priv
+	s.MyEphPub = pub
 	s.State = SessWaiting
 	return nil
 }
@@ -101,6 +112,13 @@ func (s *Session) startHandshake() error {
 // completeHandshake methods calls the deriveSessionKeys function to derive the shared
 // symmetic keys from ephemeral key meterial, assignigng them based on who initiated the handshake
 func (s *Session) completeHandshake(peerPub []byte, initiator bool) error {
+	if len(peerPub) != 32 {
+		return fmt.Errorf("invalid peer eph pub length")
+	}
+	if len(s.MyEphPriv) != 32 {
+		return fmt.Errorf("local eph key not initialized")
+	}
+
 	send, recv, err := deriveSessionKeys(s.MyEphPriv, peerPub)
 	if err != nil {
 		return err
@@ -116,7 +134,7 @@ func (s *Session) completeHandshake(peerPub []byte, initiator bool) error {
 		s.RecvKey = send
 	}
 
-	s.PeerEphPub = peerPub
+	s.PeerEphPub = append([]byte(nil), peerPub...)
 	s.State = SessReady
 	return nil
 }
@@ -124,7 +142,10 @@ func (s *Session) completeHandshake(peerPub []byte, initiator bool) error {
 // encrypt function basically encrypts the message in the sender side before sending
 // it to the reciever
 func encrypt(key []byte, ctr uint64, msg []byte) ([]byte, error) {
-	aead, _ := chacha20poly1305.New(key)
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, 12)
 	binary.BigEndian.PutUint64(nonce[4:], ctr)
 	return aead.Seal(nil, nonce, msg, nil), nil
@@ -133,7 +154,10 @@ func encrypt(key []byte, ctr uint64, msg []byte) ([]byte, error) {
 // decrypt function basically decrypts the message in the reciever side when they
 // receive the message
 func decrypt(key []byte, ctr uint64, ct []byte) ([]byte, error) {
-	aead, _ := chacha20poly1305.New(key)
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, 12)
 	binary.BigEndian.PutUint64(nonce[4:], ctr)
 	return aead.Open(nil, nonce, ct, nil)
