@@ -10,9 +10,11 @@ import (
 func printHelp() {
 	//function which prints all commands avilable to user
 	fmt.Println("Commands:")
-	fmt.Println("  /all <msg>           broadcast")
-	fmt.Println("  /to <id> <msg>       send to one user")
-	fmt.Println("  /who                 list online")
+	fmt.Println("  /invite <alias>         create invite token (share out-of-band)")
+	fmt.Println("  /connect <alias> <tok>  import peer invite")
+	fmt.Println("  /to <alias> <msg>       send encrypted message via relay queue")
+	fmt.Println("  /contacts               list local contacts/queues")
+	fmt.Println("  /help                   show commands")
 	fmt.Println()
 }
 

@@ -4,13 +4,42 @@ import (
 	"bufio"
 	"chat/internal/crypto"
 	"chat/internal/protocol"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
+
+type Invite struct {
+	Relay string `json:"relay"`
+	Queue string `json:"queue"`
+	Pub   string `json:"pub"`
+}
+
+type Envelope struct {
+	Kind       string `json:"kind"` // "hs" or "ct"
+	FromPub    string `json:"from_pub,omitempty"`
+	Eph        string `json:"eph,omitempty"`
+	Ctr        uint64 `json:"ctr,omitempty"`
+	Body       string `json:"body,omitempty"`
+	ReplyQueue string `json:"reply_queue,omitempty"`
+}
+
+type runtimeState struct {
+	mu           sync.Mutex
+	addr         string
+	contactsPath string
+	myPubB64     string
+	contacts     map[string]*Contact
+	sessions     map[string]*Session
+}
 
 func Run(addr, profile string) error {
 	/*
@@ -32,303 +61,455 @@ func Run(addr, profile string) error {
 	contactsPath := dir + "/contacts.json"
 
 	// we load the key from the file right now because we don't have the right methods ot so so
-	pub, priv, err := crypto.LoadOrCreateIdentity(idPath)
+	pub, _, err := crypto.LoadOrCreateIdentity(idPath)
+	if err != nil {
+		return err
+	}
+	myPubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	contacts, err := loadContactsBook(contactsPath)
 	if err != nil {
 		return err
 	}
 
-	contacts, err := loadContacts(contactsPath)
-	if err != nil {
-		return err
+	st := &runtimeState{
+		addr:         addr,
+		contactsPath: contactsPath,
+		myPubB64:     myPubB64,
+		contacts:     contacts,
+		sessions:     make(map[string]*Session),
 	}
 
-	//ask the user for handel before opening a connection
-	handle, err := askHandle()
-	if err != nil {
-		return err
-	}
-
-	//whoCache is gonna be out temporary in memory directory of who is currently online and what pub key they claim
-	//without this we could message users blindly
-	whoCache := make(map[string]string)
-
-	// shared per-peer E2E sessions (used by both goroutines)
-	sessions := make(map[string]*Session)
-
-	//open a network connection using tcp to server address
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close() //setup the connection to close after the function ends
-
-	// wrapping the TCP connection(conn) with a scanner to read data more easily
-	// also I have set a 1MB buffer for scanner
-	sc := bufio.NewScanner(conn)
-	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
-	if !sc.Scan() {
-		return fmt.Errorf("Server disconnected")
-	}
-
-	// when server first makes connection it sends challenege and this function runs to solve that challenge
-	if err := solveChallenge(conn, sc, pub, priv, handle); err != nil {
-		return err
-	}
-
-	// read server messages
-	go readLoop(sc, conn, contactsPath, contacts, whoCache, sessions)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pollLoop(ctx, st)
 
 	// all commands
 	printHelp()
 
-	in := bufio.NewScanner(os.Stdin)                                //reads our keyboard input
-	writeLoop(in, conn, contactsPath, contacts, whoCache, sessions) //this function will send whtever we write to the server if it is legal
+	in := bufio.NewScanner(os.Stdin) //reads our keyboard input
 
-	return nil
-}
-
-func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string, sessions map[string]*Session) error {
-	for { // infinite for loop unless input stops, network error of function returns
+	for {
 		fmt.Print("> ")
 		if !in.Scan() {
 			return nil //if false we bail out like keyboard inturrupt
 		}
 
-		// we get the user line and if parsing succeeds we move ahead in the code
-		// if parsing doesn't suceed we go to the next loop and ask again
-		toHandle, text, ok := parseCommand(strings.TrimSpace(in.Text()))
-		if !ok {
+		line := strings.TrimSpace(in.Text())
+		if line == "" {
 			continue
 		}
 
-		//if this is a DM(/to [Name]), enforce TOFU and rewrite To to pubkey
-		to := toHandle
-		if toHandle != "" {
+		if err := handleCommand(st, line); err != nil {
+			fmt.Println("[Error]", err)
+		}
+	}
 
-			//the line below checks if the client I am trying to sends msg to is online or not
-			//by checking it in the whoCache, while the server already does this right now, we need this
-			//for the fututre
-			pub, exists := whoCache[toHandle]
-			if !exists {
-				//just a little fallback so we don't have to use
-				// /who everytime this only works while the server is
-				// there tho so might need to fix this later
-				if pinned, ok := contacts[toHandle]; ok {
-					pub = pinned
-				} else {
-					fmt.Println("[error] unknow handle. Run /who first.")
-					continue
+}
+
+func handleCommand(st *runtimeState, line string) error {
+	// this function is the one that handles the commands that the user enters in the terminal
+	// it parses the command and then calls the appropriate function to handle it
+
+	switch {
+	case line == "/help":
+		printHelp()
+		return nil
+	case line == "/contacts":
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		for alias, c := range st.contacts {
+			fmt.Printf("- %s send=%s recv=%s key=%s\n", alias, c.SendQueue, c.RecvQueue, fingerprintPubKey(c.TheirPubKey))
+		}
+		return nil
+	case strings.HasPrefix(line, "/invite "):
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return fmt.Errorf("usage: /invite <alias>")
+		}
+		return cmdInvite(st, strings.TrimSpace(parts[1]))
+	case strings.HasPrefix(line, "/connect "):
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("usage: /connect <alias> <invite-token>")
+		}
+		return cmdConnect(st, parts[1], parts[2])
+	case strings.HasPrefix(line, "/to "):
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) < 3 {
+			return fmt.Errorf("usage: /to <alias> <message>")
+		}
+		return cmdSend(st, parts[1], parts[2])
+	default:
+		return fmt.Errorf("unknown command use /help")
+
+	}
+}
+
+func cmdInvite(st *runtimeState, alias string) error {
+	// this function creates an invite token for a given alias and prints it to the terminal
+	// the invite token is a base64 encoded JSON string that contains the relay address, the queue name, and the public key of the user
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	c := st.contacts[alias]
+	if c == nil {
+		c = &Contact{Alias: alias}
+		st.contacts[alias] = c
+	}
+	if c.RecvQueue == "" {
+		c.RecvQueue = randomToken(18)
+	}
+	if err := saveContactsBook(st.contactsPath, st.contacts); err != nil {
+		return err
+	}
+
+	inv := Invite{
+		Relay: st.addr,
+		Queue: c.RecvQueue,
+		Pub:   st.myPubB64,
+	}
+	raw, _ := json.Marshal(inv)
+	token := base64.RawURLEncoding.EncodeToString(raw)
+
+	fmt.Println("Share this invite out-of-band")
+	fmt.Println(token)
+	return nil
+}
+
+func cmdConnect(st *runtimeState, alias, token string) error {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return fmt.Errorf("invalid invite encoding")
+	}
+	var inv Invite
+	if err := json.Unmarshal(raw, &inv); err != nil {
+		return fmt.Errorf("invalid invite payload")
+	}
+	if inv.Queue == "" || inv.Pub == "" {
+		return fmt.Errorf("invite missing queue/pub")
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	c := st.contacts[alias]
+	if c == nil {
+		c = &Contact{Alias: alias}
+		st.contacts[alias] = c
+	}
+	if c.TheirPubKey != "" && c.TheirPubKey != inv.Pub {
+		return fmt.Errorf("TOFU mismatch for %s", alias)
+	}
+	c.TheirPubKey = inv.Pub
+	c.SendQueue = inv.Queue
+	if c.RecvQueue == "" {
+		c.RecvQueue = randomToken(18)
+	}
+
+	if err := saveContactsBook(st.contactsPath, st.contacts); err != nil {
+		return err
+	}
+
+	fmt.Printf("[TOFU] pinned %s to %s\n", alias, fingerprintPubKey(c.TheirPubKey))
+	fmt.Println("Tip: run /invite", alias, "and share back so they can reply to your queue.")
+	return nil
+}
+
+func cmdSend(st *runtimeState, alias, text string) error {
+	st.mu.Lock()
+	c := st.contacts[alias]
+	if c == nil {
+		st.mu.Unlock()
+		return fmt.Errorf("unknown contact")
+	}
+	if c.SendQueue == "" {
+		st.mu.Unlock()
+		return fmt.Errorf("contact has no send queue. run /connect first")
+	}
+	if c.RecvQueue == "" {
+		c.RecvQueue = randomToken(18)
+	}
+
+	sess := st.sessions[alias]
+	if sess == nil {
+		sess = newSession()
+		st.sessions[alias] = sess
+	}
+
+	// if there is no session then we will start handshake and queue plaintext
+	if sess.State == SessNone {
+		if err := sess.startHandshake(); err != nil {
+			st.mu.Unlock()
+			return err
+		}
+		env := Envelope{
+			Kind:       "hs",
+			FromPub:    st.myPubB64,
+			Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
+			ReplyQueue: c.RecvQueue,
+		}
+		payload, _ := json.Marshal(env)
+		sess.Outbox = append(sess.Outbox, text)
+		st.mu.Unlock()
+		return relayPut(st.addr, c.SendQueue, string(payload))
+	}
+
+	if sess.State != SessReady {
+		sess.Outbox = append(sess.Outbox, text)
+		st.mu.Unlock()
+		return nil
+	}
+
+	ctr := sess.SendCtr
+	ct, err := encrypt(sess.SendKey, ctr, []byte(text))
+	if err != nil {
+		st.mu.Unlock()
+		return err
+	}
+	sess.SendCtr++
+
+	env := Envelope{
+		Kind:       "ct",
+		FromPub:    st.myPubB64,
+		Ctr:        ctr,
+		Body:       base64.StdEncoding.EncodeToString(ct),
+		ReplyQueue: c.RecvQueue,
+	}
+
+	payload, _ := json.Marshal(env)
+	queue := c.SendQueue
+	st.mu.Unlock()
+
+	return relayPut(st.addr, queue, string(payload))
+}
+
+func pollLoop(ctx context.Context, st *runtimeState) {
+	// this function is the one that continuously polls the server for new messages and handles them accordingly
+	// it also handles the handshake process for new sessions and the decryption of incoming messages for established sessions
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		type target struct {
+			alias string
+			queue string
+		}
+
+		var targets []target
+
+		st.mu.Lock()
+		for alias, c := range st.contacts {
+			if c.RecvQueue != "" {
+				targets = append(targets, target{alias: alias, queue: c.RecvQueue})
+			}
+		}
+		st.mu.Unlock()
+
+		if len(targets) == 0 {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		for _, t := range targets {
+			resp, err := relayRequest(st.addr, protocol.Msg{Type: "poll", Queue: t.queue, Max: 32, WaitMS: 1200})
+			if err != nil || resp.Type != "poll_resp" {
+				continue
+			}
+
+			if len(resp.Items) == 0 {
+				continue
+			}
+
+			ack := make([]string, 0, len(resp.Items))
+			for _, it := range resp.Items {
+				if err := handleEnvelope(st, t.alias, it.Payload); err == nil {
+					ack = append(ack, it.MsgID)
 				}
 			}
-
-			allowed, msg := tofuObserve(contacts, toHandle, pub)
-			if msg != "" && msg != "unchanged" {
-				fmt.Println(msg)
+			if len(ack) > 0 {
+				_, _ = relayRequest(st.addr, protocol.Msg{
+					Type:   "ack",
+					Queue:  t.queue,
+					AckIDs: ack,
+				})
 			}
+		}
+	}
+}
 
-			if !allowed {
-				fmt.Println("[blocked] key mismatch")
-				continue
+func handleEnvelope(st *runtimeState, alias, payload string) error {
+	// this function takes an incoming message payload and processes it according to the session state with the sender
+	var env Envelope
+	if err := json.Unmarshal([]byte(payload), &env); err != nil {
+		return err
+	}
+
+	var toSend []struct {
+		queue   string
+		payload string
+	}
+
+	st.mu.Lock()
+	c := st.contacts[alias]
+	if c == nil {
+		c = &Contact{Alias: alias}
+		st.contacts[alias] = c
+	}
+	if env.FromPub != "" {
+		if c.TheirPubKey == "" {
+			c.TheirPubKey = env.FromPub
+			_ = saveContactsBook(st.contactsPath, st.contacts)
+			fmt.Printf("[TOFU] pinned %s to %s\n", alias, fingerprintPubKey(c.TheirPubKey))
+		} else if c.TheirPubKey != env.FromPub {
+			st.mu.Unlock()
+			return fmt.Errorf("TOFU mismatch!!")
+		}
+	}
+	if env.ReplyQueue != "" && c.SendQueue == "" {
+		c.SendQueue = env.ReplyQueue
+		_ = saveContactsBook(st.contactsPath, st.contacts)
+	}
+
+	// we check if there is a session if not then we start a new session
+	sess := st.sessions[alias]
+	if sess == nil {
+		sess = newSession()
+		st.sessions[alias] = sess
+	}
+
+	switch env.Kind {
+	case "hs":
+		peerEph, err := base64.StdEncoding.DecodeString(env.Eph)
+		if err != nil {
+			st.mu.Unlock()
+			return err
+		}
+
+		responderStarted := false
+		if sess.State == SessNone {
+			if err := sess.startHandshake(); err != nil {
+				st.mu.Unlock()
+				return err
 			}
+			responderStarted = true
 
-			//save on first sight
-			if err := saveContacts(contactsPath, contacts); err != nil {
-				fmt.Println("failed to save contacts: ", err)
+			replyEnv := Envelope{
+				Kind:       "hs",
+				FromPub:    st.myPubB64,
+				Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
+				ReplyQueue: c.RecvQueue,
 			}
+			b, _ := json.Marshal(replyEnv)
+			toSend = append(toSend, struct {
+				queue   string
+				payload string
+			}{queue: c.SendQueue, payload: string(b)})
+		}
 
-			to = pub // we need to route the SESSION by the pubkey
+		initiator := !responderStarted && sess.State == SessWaiting
+		if err := sess.completeHandshake(peerEph, initiator); err != nil {
+			st.mu.Unlock()
+			return err
+		}
 
-			//we do this because we are sendign to public key not handle
-			//sending the message
-			sess, ok := sessions[to]
-			if !ok {
-				sess = newSession()
-				sessions[to] = sess
-			}
-
-			//starting the handshake if not doen already
-			if sess.State == SessNone {
-				sess.startHandshake()
-
-				//sending the handshake message to the client
-				hm := protocol.Msg{
-					Type:   "handshake",
-					To:     to,
-					PubKey: base64.StdEncoding.EncodeToString(sess.MyEphPub),
-				}
-
-				b, _ := json.Marshal(hm)
-
-				b = append(b, '\n')
-				conn.Write(b)
-
-				sess.Outbox = append(sess.Outbox, text)
-				continue
-			}
-
-			if sess.State != SessReady {
-				sess.Outbox = append(sess.Outbox, text)
-				continue
-			}
-
-			//we will encrypt the message now
-			ct, err := encrypt(sess.SendKey, sess.SendCtr, []byte(text))
+		for _, msg := range sess.Outbox {
+			ctr := sess.SendCtr
+			ct, err := encrypt(sess.SendKey, ctr, []byte(msg))
 			if err != nil {
-				fmt.Println("encrypt failed")
 				continue
 			}
 			sess.SendCtr++
-
-			text = base64.StdEncoding.EncodeToString(ct)
+			out := Envelope{
+				Kind:       "ct",
+				FromPub:    st.myPubB64,
+				Ctr:        ctr,
+				Body:       base64.StdEncoding.EncodeToString(ct),
+				ReplyQueue: c.RecvQueue,
+			}
+			b, _ := json.Marshal(out)
+			toSend = append(toSend, struct {
+				queue   string
+				payload string
+			}{queue: c.SendQueue, payload: string(b)})
 		}
-
-		// we create a message struct, Marshal converts it to JSON and then we add a new lin
-		// most TCP connections are newline-delimited so message is seperated by new line
-		m := protocol.Msg{Type: "send", To: to, Text: text}
-		b, _ := json.Marshal(m)
-		b = append(b, '\n')
-
-		//we now send the message over TCP and if it fails we just disconnect
-		if _, err := conn.Write(b); err != nil {
-			fmt.Println("disconnected")
+		sess.Outbox = nil
+	case "ct":
+		if sess.State != SessReady {
+			st.mu.Unlock()
+			return fmt.Errorf("cipher before ready session")
+		}
+		ct, err := base64.StdEncoding.DecodeString(env.Body)
+		if err != nil {
+			st.mu.Unlock()
 			return err
 		}
+		pt, err := decrypt(sess.RecvKey, env.Ctr, ct)
+		if err != nil {
+			st.mu.Unlock()
+			return err
+		}
+		if env.Ctr >= sess.RecvCtr {
+			sess.RecvCtr = env.Ctr + 1
+		}
+		fmt.Printf("[%s] %s\n", alias, string(pt))
 	}
+	st.mu.Unlock()
 
-}
-
-func readLoop(sc *bufio.Scanner, conn net.Conn, contactsPath string, contacts map[string]string, whoCache map[string]string, sessions map[string]*Session) {
-	/*
-		function that reads the stuff the server sends(what other client sends) and use the same connection as in Run() function
-	*/
-
-	//run as long as the server keeps sends or '\n' is there
-	for sc.Scan() {
-		var m protocol.Msg // gets the JSON message adn tries to decode it c
-		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
-			fmt.Println("<< bad message from server >>")
+	for _, s := range toSend {
+		if s.queue == "" || s.payload == "" {
 			continue
 		}
-		switch m.Type {
-		case "welcome": // if first time tell use ID and welcome test from server
-			fmt.Printf("[server] your id: %s\n", m.ID)
-			fmt.Printf("[server] %s\n", m.Text)
-		case "msg": // display message when it is a brodcast (/all)
-			fmt.Printf("[%s] %s\n", m.From, m.Text)
-		case "send": //display e2e encrypted messages that are recieved
-			sess, ok := sessions[m.From]
-			if !ok || sess.State != SessReady {
-				fmt.Println("[warning] there is a encrypted messaged but there is no session")
-				continue
-			}
-
-			ct, _ := base64.StdEncoding.DecodeString(m.Text)
-			pt, err := decrypt(sess.RecvKey, sess.RecvCtr, ct)
-			if err != nil {
-				fmt.Println("[decryption failed]")
-				continue
-			}
-			sess.RecvCtr++
-
-			fmt.Printf("[%s] %s\n", m.From, string(pt))
-		case "who_resp":
-			for _, p := range m.Peers {
-				whoCache[p.Handle] = p.PubKey //add the online client with to whoCache
-
-				allowed, msg := tofuObserve(contacts, p.Handle, p.PubKey)
-				if msg != "" {
-					fmt.Println(msg)
-				}
-				if allowed {
-					saveContacts(contactsPath, contacts)
-				}
-			}
-		case "handshake":
-			peerPub, _ := base64.StdEncoding.DecodeString(m.PubKey)
-
-			sess, ok := sessions[m.From]
-			if !ok {
-				sess = newSession()
-				sessions[m.From] = sess
-			}
-
-			// Track whether we just created responder state.
-			responderStarted := false
-
-			//we will reply if we didn't initiate
-			if sess.State == SessNone {
-				sess.startHandshake()
-				responderStarted = true
-
-				reply := protocol.Msg{
-					Type:   "handshake",
-					To:     m.From,
-					PubKey: base64.StdEncoding.EncodeToString(sess.MyEphPub),
-				}
-				b, _ := json.Marshal(reply)
-				b = append(b, '\n')
-				conn.Write(b)
-			}
-
-			// initiator iff we were already waiting before this inbound handshake
-			initiator := !responderStarted && sess.State == SessWaiting
-			sess.completeHandshake(peerPub, initiator)
-
-			//we will flush queued messages now
-			for _, msg := range sess.Outbox {
-				ct, _ := encrypt(sess.SendKey, sess.SendCtr, []byte(msg))
-				sess.SendCtr++
-
-				send := protocol.Msg{
-					Type: "send",
-					To:   m.From,
-					Text: base64.StdEncoding.EncodeToString(ct),
-				}
-				b, _ := json.Marshal(send)
-				b = append(b, '\n')
-				conn.Write(b)
-			}
-			sess.Outbox = nil
-		case "error": // if there is any error that was returned
-			fmt.Printf("[error] %s\n", m.Text)
-		default:
-			fmt.Printf("[server] %+v\n", m)
-		}
+		_ = relayPut(st.addr, s.queue, s.payload)
 	}
+	return nil
 
-	// server closed the connection
-	os.Exit(0)
 }
 
-func parseCommand(line string) (to string, text string, ok bool) {
-	/*
-		this function parses the input user inters input scanner in the Run() function
-	*/
+func relayPut(addr, queue, payload string) error {
+	_, err := relayRequest(addr, protocol.Msg{
+		Type:    "put",
+		Queue:   queue,
+		MsgID:   randomToken(12),
+		Payload: payload,
+	})
+	return err
+}
 
-	//if user entered nothing
-	if line == "" {
-		return "", "", false
+func relayRequest(addr string, req protocol.Msg) (protocol.Msg, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return protocol.Msg{}, err
+	}
+	defer conn.Close()
+
+	b, _ := json.Marshal(req)
+	b = append(b, '\n')
+	if _, err := conn.Write(b); err != nil {
+		return protocol.Msg{}, err
 	}
 
-	// if user wanted to send a message to a specific use then we return to, text and the if it was parsed or not
-	if strings.HasPrefix(line, "/to ") {
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) < 3 {
-			fmt.Println("usage: /to <id> <msg>")
-			return "", "", false
-		}
-		return parts[1], parts[2], true
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+	if !sc.Scan() {
+		return protocol.Msg{}, fmt.Errorf("no response")
 	}
-
-	// if the user wanted to send it to everyone who is connected to server
-	if strings.HasPrefix(line, "/all ") {
-		return "", strings.TrimPrefix(line, "/all "), true
+	var resp protocol.Msg
+	if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
+		return protocol.Msg{}, err
 	}
-
-	if line == "/who" {
-		return "", "/who", true
+	if resp.Type == "error" {
+		return resp, errors.New(resp.Text)
 	}
+	return resp, nil
+}
 
-	fmt.Println("unknown command, use /all, /to, /who")
-	return "", "", false
+func randomToken(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
 }

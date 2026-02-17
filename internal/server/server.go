@@ -84,10 +84,10 @@ func (s *relayStore) ack(queue string, ackIDs []string) {
 
 	kept := old[:0]
 	for _, it := range old {
-		if _, done := ackSet[it.MsgID]; !done {
-			continue
+		if _, done := ackSet[it.MsgID]; done {
+			continue // we will drop ACKed messages here
 		}
-		kept = append(kept, it)
+		kept = append(kept, it) // this will make sure we keep unacked messages
 	}
 	s.data[queue] = append([]protocol.RelayItem(nil), kept...)
 }

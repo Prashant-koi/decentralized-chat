@@ -33,7 +33,7 @@ type Msg struct {
 	Queue   string      `json:"queue,omitempty"`  // which queue to push to or pull from
 	MsgID   string      `json:"msg_id,omitempty"` // unique id for the message, client generated for send, server generated for recv
 	Payload string      `json:"payload,omitempty"`
-	AckIDs  []string    `json:"ask_ids,omitempty"` // for pull response, which msg ids are being acked by the client
+	AckIDs  []string    `json:"ack_ids,omitempty"` // for pull response, which msg ids are being acked by the client
 	Items   []RelayItem `json:"items,omitempty"`
 	Max     int         `json:"max,omitempty"`     // for pull, max number of messages to pull
 	WaitMS  int         `json:"wait_ms,omitempty"` // for pull, how long to wait if no messages
