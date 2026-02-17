@@ -213,9 +213,9 @@ func readLoop(sc *bufio.Scanner, conn net.Conn, contactsPath string, contacts ma
 		case "welcome": // if first time tell use ID and welcome test from server
 			fmt.Printf("[server] your id: %s\n", m.ID)
 			fmt.Printf("[server] %s\n", m.Text)
-		case "msg": // display message from normal user/other client
+		case "msg": // display message when it is a brodcast (/all)
 			fmt.Printf("[%s] %s\n", m.From, m.Text)
-		case "send":
+		case "send": //display e2e encrypted messages that are recieved
 			sess, ok := sessions[m.From]
 			if !ok || sess.State != SessReady {
 				fmt.Println("[warning] there is a encrypted messaged but there is no session")
