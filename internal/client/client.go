@@ -81,7 +81,7 @@ func Run(addr, profile string) error {
 	// all commands
 	printHelp()
 
-	in := bufio.NewScanner(os.Stdin)                      //reads our keyboard input
+	in := bufio.NewScanner(os.Stdin)                                //reads our keyboard input
 	writeLoop(in, conn, contactsPath, contacts, whoCache, sessions) //this function will send whtever we write to the server if it is legal
 
 	return nil
@@ -135,6 +135,8 @@ func writeLoop(in *bufio.Scanner, conn net.Conn, contactsPath string, contacts m
 			if err := saveContacts(contactsPath, contacts); err != nil {
 				fmt.Println("failed to save contacts: ", err)
 			}
+
+			to = pub // we need to route the SESSION by the pubkey
 
 			//we do this because we are sendign to public key not handle
 			//sending the message
@@ -212,6 +214,8 @@ func readLoop(sc *bufio.Scanner, conn net.Conn, contactsPath string, contacts ma
 			fmt.Printf("[server] your id: %s\n", m.ID)
 			fmt.Printf("[server] %s\n", m.Text)
 		case "msg": // display message from normal user/other client
+			fmt.Printf("[%s] %s\n", m.From, m.Text)
+		case "send":
 			sess, ok := sessions[m.From]
 			if !ok || sess.State != SessReady {
 				fmt.Println("[warning] there is a encrypted messaged but there is no session")

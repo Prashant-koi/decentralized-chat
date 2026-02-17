@@ -228,7 +228,7 @@ func HandleConn(conn net.Conn) {
 		}
 
 		switch m.Type {
-		case "send", "hs1", "hs2", "ct":
+		case "send", "hs1", "hs2", "ct", "handshake":
 			//allowed
 		default:
 			sendJSON(c, protocol.Msg{Type: "error", Text: "unknown type"})
