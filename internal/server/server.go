@@ -3,266 +3,161 @@ package server
 import (
 	"bufio"
 	"chat/internal/protocol"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
-type Client struct {
-	pub    string
-	handle string
-	conn   net.Conn
-	send   chan []byte
+// This is a simple in-memory relay server implementation.
+type relayStore struct {
+	mu    sync.Mutex
+	data  map[string][]protocol.RelayItem
+	dedup map[string]map[string]struct{}
 }
 
-var (
-	mu      sync.Mutex
-	clients = map[string]*Client{}
-	handle  = map[string]string{}
-)
-
-func addClient(c *Client) error {
-	/*
-		return false if a client that is already connected is
-		trying to connect else true
-	*/
-	mu.Lock()
-	defer mu.Unlock()
-
-	if _, exists := clients[c.pub]; exists {
-		return fmt.Errorf("pubkey already exists")
-	}
-
-	if _, exists := handle[c.handle]; exists {
-		return fmt.Errorf("handle already taken")
-	}
-
-	clients[c.pub] = c
-	handle[c.handle] = c.pub
-	return nil
+// store is a global instance of relayStore
+var store = &relayStore{
+	data:  make(map[string][]protocol.RelayItem),
+	dedup: make(map[string]map[string]struct{}),
 }
 
-func removeClient(pub string) {
-	mu.Lock()
-	defer mu.Unlock()
+// put adds a message to the specified queue if it hasn't been added before (deduplication based on msgID).
+func (s *relayStore) put(queue string, msgID, payload string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if c, ok := clients[pub]; ok {
-		delete(handle, c.handle)
+	if _, exists := s.dedup[queue]; !exists {
+		s.dedup[queue] = make(map[string]struct{})
 	}
 
-	delete(clients, pub)
-}
-
-func getClient(pub string) (*Client, bool) {
-	mu.Lock()
-	defer mu.Unlock()
-	c, ok := clients[pub]
-	return c, ok
-}
-
-func listHandles() []string {
-	mu.Lock()
-	defer mu.Unlock()
-	out := make([]string, 0, len(handle))
-	for h := range handle {
-		out = append(out, h)
-		out = append(out, ",")
+	if _, exists := s.dedup[queue][msgID]; exists {
+		return
 	}
+	s.dedup[queue][msgID] = struct{}{}
+
+	s.data[queue] = append(s.data[queue], protocol.RelayItem{
+		MsgID:   msgID,
+		Payload: payload,
+		TS:      time.Now().UnixMilli(),
+	})
+}
+
+// poll retrieves up to 'max' messages from the specified queue without removing them.
+// It returns an empty slice if there are no messages.
+func (s *relayStore) poll(queue string, max int) []protocol.RelayItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	items := s.data[queue]
+	if len(items) == 0 {
+		return nil
+	}
+
+	if max <= 0 || max > len(items) {
+		max = len(items)
+	}
+
+	out := make([]protocol.RelayItem, max)
+	copy(out, items[:max])
 	return out
 }
 
-func writeLoop(c *Client) {
-	for b := range c.send {
-		_, err := c.conn.Write(b)
-		if err != nil {
-			return
-		}
+// ack removes messages with the specified msgIDs from the queue, simulating acknowledgment of message processing by clients.
+func (s *relayStore) ack(queue string, ackIDs []string) {
+	if len(ackIDs) == 0 {
+		return
 	}
-}
 
-// while sending if their send buffer is full
-// we drop to keep simple
-func sendJSON(c *Client, m protocol.Msg) {
-	b, _ := json.Marshal(m)
-	b = append(b, '\n')
-	select {
-	case c.send <- b:
-	default:
-
+	ackSet := make(map[string]struct{}, len(ackIDs))
+	for _, id := range ackIDs {
+		ackSet[id] = struct{}{}
 	}
-}
 
-func broadcast(fromID string, m protocol.Msg) {
-	mu.Lock()
-	defer mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for id, c := range clients {
-		if id == fromID {
+	old := s.data[queue]
+	if len(old) == 0 {
+		return
+	}
+
+	kept := old[:0]
+	for _, it := range old {
+		if _, done := ackSet[it.MsgID]; !done {
 			continue
 		}
-		sendJSON(c, m)
+		kept = append(kept, it)
 	}
+	s.data[queue] = append([]protocol.RelayItem(nil), kept...)
 }
 
-func clientAuth(c *Client, sc *bufio.Scanner) (protocol.Msg, error) {
-	/*
-		We need to make sure that the client is the one with the public key
-		that is why we send a little challenge to the client expecting a hello
-		with pubkey and signature and we crossvalidate those and then verify the
-		signature at last after that in the handleConn function we proceed as normal
-	*/
-
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return protocol.Msg{}, err
-	}
-
-	nonceb64 := base64.StdEncoding.EncodeToString(nonce)
-	sendJSON(c, protocol.Msg{Type: "challenge", Nonce: nonceb64})
-
-	if !sc.Scan() {
-		return protocol.Msg{}, fmt.Errorf("scan failed")
-	}
-
-	var hello protocol.Msg
-	if err := json.Unmarshal(sc.Bytes(), &hello); err != nil {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "bad JSON"})
-		return protocol.Msg{}, err
-	}
-
-	if hello.Type != "hello" || hello.PubKey == "" || hello.Sig == "" {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "expected hello, didn't get"})
-		return protocol.Msg{}, fmt.Errorf("didn't get hello")
-	}
-
-	pubBytes, err := base64.StdEncoding.DecodeString(hello.PubKey)
-	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "Bad public key"})
-		return protocol.Msg{}, err
-	}
-
-	sigBytes, err := base64.StdEncoding.DecodeString(hello.Sig)
-	if err != nil || len(sigBytes) != ed25519.SignatureSize {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "Bad Signature"})
-		return protocol.Msg{}, err
-	}
-
-	if !ed25519.Verify(ed25519.PublicKey(pubBytes), nonce, sigBytes) {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "Signature not verified"})
-		return protocol.Msg{}, fmt.Errorf("signature verification failed")
-	}
-
-	return hello, nil
-
+func writeJSON(conn net.Conn, m protocol.Msg) {
+	b, _ := json.Marshal(m)
+	b = append(b, '\n')
+	_, _ = conn.Write(b)
 }
 
-func resolveToPub(to string) string {
-	/*
-		this function resolved handle to the publick key while sending a message
-	*/
-	mu.Lock()
-	defer mu.Unlock()
-
-	if pub, ok := handle[to]; ok {
-		return pub
-	}
-
-	return to //we will allow raw public key too
-}
-
-// HandleConn manages a single client lifecycle.
+// HandleConn processes incoming connections to the relay server.
+// It reads a JSON message from the connection, determines the type of request (put, poll, ack),
+// and interacts with the relayStore accordingly
+// It also sends back appropriate responses based on the request type and any errors encountered.
 func HandleConn(conn net.Conn) {
-	/*
-		first verify the client is actually the one who they say they are and
-		then proceed normally
-	*/
 	defer conn.Close()
 
-	c := &Client{
-		pub:  "",
-		conn: conn,
-		send: make(chan []byte, 32),
-	}
-
-	go writeLoop(c)
-	defer close(c.send)
+	// Use a buffered scanner to read the incoming JSON message from the connection.
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
 
-	hello, err := clientAuth(c, sc)
-	if err != nil {
-		sendJSON(c, protocol.Msg{Type: "error", Text: err.Error()})
+	if !sc.Scan() {
 		return
 	}
 
-	c.pub = hello.PubKey
-	c.handle = hello.Handle
-	if c.handle == "" {
-		sendJSON(c, protocol.Msg{Type: "error", Text: "handle required"})
+	var req protocol.Msg
+	if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+		writeJSON(conn, protocol.Msg{Type: "error", Text: "bad json"})
 		return
 	}
 
-	if err := addClient(c); err != nil {
-		sendJSON(c, protocol.Msg{Type: "error", Text: err.Error()})
-		return
-	}
-
-	defer removeClient(c.pub)
-
-	//welcome message and join message
-	sendJSON(c, protocol.Msg{Type: "welcome", ID: c.pub, Text: "Use /all <msg> or /to <id> <msg> or /who"})
-
-	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s joined", c.handle)})
-
-	for sc.Scan() {
-		line := sc.Bytes()
-
-		var m protocol.Msg
-		if err := json.Unmarshal(line, &m); err != nil {
-			sendJSON(c, protocol.Msg{Type: "error", Text: "bad json"})
-			continue
+	switch req.Type {
+	case "put": // if the type is "put", the server expects a message to be added to a queue.
+		if req.Queue == "" || req.MsgID == "" || req.Payload == "" {
+			writeJSON(conn, protocol.Msg{Type: "error", Text: "missing queue, msg_id, or payload"})
+			return
+		}
+		store.put(req.Queue, req.MsgID, req.Payload)
+		writeJSON(conn, protocol.Msg{Type: "ok", MsgID: req.MsgID})
+	case "poll": // if the type is "poll", the server expects a request to retrieve messages from a queue.
+		if req.Queue == "" {
+			writeJSON(conn, protocol.Msg{Type: "error", Text: "missing queue"})
+			return
+		}
+		if req.WaitMS < 0 {
+			req.WaitMS = 0
+		}
+		if req.Max <= 0 {
+			req.Max = 32
 		}
 
-		switch m.Type {
-		case "send", "hs1", "hs2", "ct", "handshake":
-			//allowed
-		default:
-			sendJSON(c, protocol.Msg{Type: "error", Text: "unknown type"})
-			continue
-		}
-
-		text := m.Text
-		if text == "/who" {
-			mu.Lock()
-			peers := make([]protocol.Msg, 0, len(clients))
-			for _, cc := range clients {
-				peers = append(peers, protocol.Msg{Handle: cc.handle, PubKey: cc.pub})
+		deadline := time.Now().Add(time.Duration(req.WaitMS) * time.Millisecond)
+		for {
+			items := store.poll(req.Queue, req.Max)
+			if len(items) > 0 || time.Now().After(deadline) || req.WaitMS == 0 {
+				writeJSON(conn, protocol.Msg{Type: "poll_resp", Queue: req.Queue, Items: items})
+				return
 			}
-			mu.Unlock()
-
-			sendJSON(c, protocol.Msg{Type: "who_resp", Peers: peers})
-			continue
+			time.Sleep(100 * time.Millisecond)
 		}
 
-		//route
-		if m.To != "" {
-			toPub := resolveToPub(m.To)
-			target, ok := getClient(toPub)
-			if !ok {
-				sendJSON(c, protocol.Msg{Type: "error", Text: "no such client"})
-				continue
-			}
-			m.From = c.pub
-			sendJSON(target, m)
-		} else {
-			broadcast(c.pub, protocol.Msg{Type: "msg", From: c.handle, Text: text})
+	case "ack": // if the type is "ack", the server expects a request to acknowledge the processing of messages, which will remove them from the queue.
+		if req.Queue == "" {
+			writeJSON(conn, protocol.Msg{Type: "error", Text: "missing queue"})
+			return
 		}
+		store.ack(req.Queue, req.AckIDs)
+		writeJSON(conn, protocol.Msg{Type: "ok"})
+	default:
+		writeJSON(conn, protocol.Msg{Type: "error", Text: "unknown type"})
 	}
 
-	//announce leave
-	broadcast(c.pub, protocol.Msg{Type: "msg", From: "server", Text: fmt.Sprintf("%s left", c.pub)})
 }

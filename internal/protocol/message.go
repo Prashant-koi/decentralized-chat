@@ -1,5 +1,12 @@
 package protocol
 
+// Msg defines the structure of messages exchanged between clients and the server.
+type RelayItem struct {
+	MsgID   string `json:"msg_id,omitempty"`
+	Payload string `json:"payload,omitempty"`
+	TS      int64  `json:"ts,omitempty"`
+}
+
 type Msg struct {
 	Type string `json:"type"`
 	//Identity
@@ -21,4 +28,13 @@ type Msg struct {
 	Eph  string `json:"eph,omitempty"`  // base64 x25519 ephemeral pub
 	Body string `json:"body,omitempty"` // base64 cipher text
 	Ctr  uint64 `json:"ctr,omitempty"`  // replay protection counter
+
+	// relay mailbox fields
+	Queue   string      `json:"queue,omitempty"`  // which queue to push to or pull from
+	MsgID   string      `json:"msg_id,omitempty"` // unique id for the message, client generated for send, server generated for recv
+	Payload string      `json:"payload,omitempty"`
+	AckIDs  []string    `json:"ask_ids,omitempty"` // for pull response, which msg ids are being acked by the client
+	Items   []RelayItem `json:"items,omitempty"`
+	Max     int         `json:"max,omitempty"`     // for pull, max number of messages to pull
+	WaitMS  int         `json:"wait_ms,omitempty"` // for pull, how long to wait if no messages
 }
