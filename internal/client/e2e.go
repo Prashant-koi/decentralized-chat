@@ -12,30 +12,6 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-type SessionState int
-
-const (
-	SessNone SessionState = iota
-	SessWaiting
-	SessReady
-)
-
-type Session struct {
-	State SessionState
-
-	MyEphPriv  []byte //32 bytes
-	MyEphPub   []byte // 32 bytes
-	PeerEphPub []byte
-
-	SendKey []byte
-	RecvKey []byte
-
-	SendCtr uint64
-	RecvCtr uint64
-
-	Outbox []string // queued plaintext while handshake
-}
-
 func newSession() *Session {
 	return &Session{
 		State: SessNone,
