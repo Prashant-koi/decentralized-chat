@@ -179,6 +179,9 @@ func cmdInvite(st *runtimeState, alias string) error {
 }
 
 func cmdConnect(st *runtimeState, alias, token string) error {
+	// this function takes an invite token and imports the contact information from it, it also pins the public key to the alias if it's not already pinned
+	// the invite token is a base64 encoded JSON string that contains the relay address, the queue name, and the public key of the user
+	// we also check for TOFU mismatch here if the alias already exists with a different pubkey we will return an error to avoid impersonation
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		return fmt.Errorf("invalid invite encoding")
@@ -218,6 +221,7 @@ func cmdConnect(st *runtimeState, alias, token string) error {
 }
 
 func cmdSend(st *runtimeState, alias, text string) error {
+	// this function sends a message to a given alias, it handles the encryption of the message and the handshake process if there is no established session with the alias
 	st.mu.Lock()
 	c := st.contacts[alias]
 	if c == nil {
@@ -244,7 +248,7 @@ func cmdSend(st *runtimeState, alias, text string) error {
 			st.mu.Unlock()
 			return err
 		}
-		env := Envelope{
+		env := Envelope{ // this is the initial handshake message that we send to the peer to start the handshake process
 			Kind:       "hs",
 			FromPub:    st.myPubB64,
 			Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
@@ -256,21 +260,23 @@ func cmdSend(st *runtimeState, alias, text string) error {
 		return relayPut(st.addr, c.SendQueue, string(payload))
 	}
 
+	// if the session is not ready we queue the plaintext messages to be sent after the handshake is complete
 	if sess.State != SessReady {
 		sess.Outbox = append(sess.Outbox, text)
 		st.mu.Unlock()
 		return nil
 	}
 
+	// if the session is ready we encrypt the message and send it to the peer
 	ctr := sess.SendCtr
 	ct, err := encrypt(sess.SendKey, ctr, []byte(text))
 	if err != nil {
 		st.mu.Unlock()
 		return err
 	}
-	sess.SendCtr++
+	sess.SendCtr++ // we increment the send counter after using it for encryption to maintain the correct order of messages and ensure replay protection
 
-	env := Envelope{
+	env := Envelope{ // this is the ciphertext message that we send to the peer after the handshake is complete
 		Kind:       "ct",
 		FromPub:    st.myPubB64,
 		Ctr:        ctr,
@@ -286,8 +292,8 @@ func cmdSend(st *runtimeState, alias, text string) error {
 }
 
 func pollLoop(ctx context.Context, st *runtimeState) {
-	// this function is the one that continuously polls the server for new messages and handles them accordingly
-	// it also handles the handshake process for new sessions and the decryption of incoming messages for established sessions
+	// this function runs in a loop and polls the server for new messages for each contact that has a receive queue,
+	// it also handles the incoming messages and sends acknowledgments to the server for the messages that have been successfully processed
 	for {
 		select {
 		case <-ctx.Done():
@@ -303,7 +309,7 @@ func pollLoop(ctx context.Context, st *runtimeState) {
 		var targets []target
 
 		st.mu.Lock()
-		for alias, c := range st.contacts {
+		for alias, c := range st.contacts { // we look for contacts that have a receive queue to poll from, if they don't have a receive queue we skip them
 			if c.RecvQueue != "" {
 				targets = append(targets, target{alias: alias, queue: c.RecvQueue})
 			}
@@ -315,7 +321,7 @@ func pollLoop(ctx context.Context, st *runtimeState) {
 			continue
 		}
 
-		for _, t := range targets {
+		for _, t := range targets { // we loop through the targets and poll the server for new messages for each target
 			resp, err := relayRequest(st.addr, protocol.Msg{Type: "poll", Queue: t.queue, Max: 32, WaitMS: 1200})
 			if err != nil || resp.Type != "poll_resp" {
 				continue
@@ -325,13 +331,14 @@ func pollLoop(ctx context.Context, st *runtimeState) {
 				continue
 			}
 
+			// we handle each incoming message and if the handling is successful we acknowledge the message to the server to remove it from the queue
 			ack := make([]string, 0, len(resp.Items))
 			for _, it := range resp.Items {
 				if err := handleEnvelope(st, t.alias, it.Payload); err == nil {
 					ack = append(ack, it.MsgID)
 				}
 			}
-			if len(ack) > 0 {
+			if len(ack) > 0 { // if we have any messages to acknowledge we send an ack request to the server with the message ids of the messages we have successfully processed
 				_, _ = relayRequest(st.addr, protocol.Msg{
 					Type:   "ack",
 					Queue:  t.queue,
@@ -343,7 +350,8 @@ func pollLoop(ctx context.Context, st *runtimeState) {
 }
 
 func handleEnvelope(st *runtimeState, alias, payload string) error {
-	// this function takes an incoming message payload and processes it according to the session state with the sender
+	// this function handles the incoming messages from the server for a given alias, it parses the message and then processes it based on the type of the message
+	// for handshake messages we complete the handshake process and for ciphertext messages we decrypt them and print them to the terminal
 	var env Envelope
 	if err := json.Unmarshal([]byte(payload), &env); err != nil {
 		return err
@@ -360,7 +368,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 		c = &Contact{Alias: alias}
 		st.contacts[alias] = c
 	}
-	if env.FromPub != "" {
+	if env.FromPub != "" { // here we check the TOFU for inpersination
 		if c.TheirPubKey == "" {
 			c.TheirPubKey = env.FromPub
 			_ = saveContactsBook(st.contactsPath, st.contacts)
@@ -383,7 +391,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 	}
 
 	switch env.Kind {
-	case "hs":
+	case "hs": // this is a handshake message that we receive from the peer to complete the handshake process
 		peerEph, err := base64.StdEncoding.DecodeString(env.Eph)
 		if err != nil {
 			st.mu.Unlock()
@@ -398,7 +406,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 			}
 			responderStarted = true
 
-			replyEnv := Envelope{
+			replyEnv := Envelope{ // this is the handshake message that we send back to the peer to complete the handshake process if we are the responder
 				Kind:       "hs",
 				FromPub:    st.myPubB64,
 				Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
@@ -411,6 +419,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 			}{queue: c.SendQueue, payload: string(b)})
 		}
 
+		// if we recieve handshake we are the responder if we started handshake we are the initiator, this makes sure we derive the correct shared keys
 		initiator := !responderStarted && sess.State == SessWaiting
 		if err := sess.completeHandshake(peerEph, initiator); err != nil {
 			st.mu.Unlock()
@@ -424,7 +433,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 				continue
 			}
 			sess.SendCtr++
-			out := Envelope{
+			out := Envelope{ // this is the ciphertext message that we send to the peer after the handshake is complete
 				Kind:       "ct",
 				FromPub:    st.myPubB64,
 				Ctr:        ctr,
@@ -438,7 +447,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 			}{queue: c.SendQueue, payload: string(b)})
 		}
 		sess.Outbox = nil
-	case "ct":
+	case "ct": // this is a ciphertext message that we receive from the peer and we need to decrypt it and print it to the terminal
 		if sess.State != SessReady {
 			st.mu.Unlock()
 			return fmt.Errorf("cipher before ready session")
@@ -471,6 +480,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 }
 
 func relayPut(addr, queue, payload string) error {
+	// this function is a helper function that sends a "put" request to the relay server to send a message to a given queue
 	_, err := relayRequest(addr, protocol.Msg{
 		Type:    "put",
 		Queue:   queue,
@@ -481,6 +491,8 @@ func relayPut(addr, queue, payload string) error {
 }
 
 func relayRequest(addr string, req protocol.Msg) (protocol.Msg, error) {
+	// this function is a helper function that sends a request to the relay server and waits for the response
+	// this basically handels th low level details of connection to the server
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return protocol.Msg{}, err
@@ -508,6 +520,7 @@ func relayRequest(addr string, req protocol.Msg) (protocol.Msg, error) {
 	return resp, nil
 }
 
+// this generates a random token of a given length and encodes it in base64
 func randomToken(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
