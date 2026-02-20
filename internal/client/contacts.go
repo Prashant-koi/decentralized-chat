@@ -10,6 +10,7 @@ type Contact struct {
 	TheirPubKey string `json:"their_pubkey,omitempty"` //pinned iddentity key fo this contact
 	SendQueue   string `json:"send_queue,omitempty"`   // this is where we PUT to reach peer
 	RecvQueue   string `json:"recv_queue,omitempty"`   // this is where we POLL to receive from peer
+	verified    bool
 }
 
 // loadContacts loads the contacts from a JSON file. If the file does not exist, it returns an empty map.

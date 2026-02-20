@@ -30,7 +30,7 @@ func Run(addr, profile string) error {
 	contactsPath := dir + "/contacts.json"
 
 	// we load the key from the file right now because we don't have the right methods ot so so
-	pub, _, err := crypto.LoadOrCreateIdentity(idPath)
+	pub, priv, err := crypto.LoadOrCreateIdentity(idPath)
 	if err != nil {
 		return err
 	}
@@ -45,6 +45,7 @@ func Run(addr, profile string) error {
 		addr:         addr,
 		contactsPath: contactsPath,
 		myPubB64:     myPubB64,
+		myPriv:       priv,
 		contacts:     contacts,
 		sessions:     make(map[string]*Session),
 	}
