@@ -132,6 +132,10 @@ func cmdSend(st *runtimeState, alias, text string) error {
 		st.mu.Unlock()
 		return fmt.Errorf("contact has no send queue. run /connect first")
 	}
+	if c.TheirPubKey == "" {
+		st.mu.Unlock()
+		return fmt.Errorf("contact has no pinned pubkey. run /connect first")
+	}
 	if c.RecvQueue == "" {
 		c.RecvQueue = randomToken(18)
 	}
@@ -148,20 +152,20 @@ func cmdSend(st *runtimeState, alias, text string) error {
 			st.mu.Unlock()
 			return err
 		}
-		env := Envelope{ // this is the initial handshake message that we send to the peer to start the handshake process
-			Kind:       "hs",
-			FromPub:    st.myPubB64,
-			Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
-			ReplyQueue: c.RecvQueue,
+		env, err := buildHS1(st, sess, c.RecvQueue)
+		if err != nil {
+			st.mu.Unlock()
+			return err
 		}
 		payload, _ := json.Marshal(env)
 		sess.Outbox = append(sess.Outbox, text)
+		queue := c.SendQueue
 		st.mu.Unlock()
-		return relayPut(st.addr, c.SendQueue, string(payload))
+		return relayPut(st.addr, queue, string(payload))
 	}
 
-	// if the session is not ready we queue the plaintext messages to be sent after the handshake is complete
-	if sess.State != SessReady {
+	// if the session is not ready we queue the palintext messages to be sent after the handshake is complete
+	if sess.State != SessReady || !sess.Authenticated {
 		sess.Outbox = append(sess.Outbox, text)
 		st.mu.Unlock()
 		return nil

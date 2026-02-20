@@ -14,7 +14,8 @@ import (
 
 func newSession() *Session {
 	return &Session{
-		State: SessNone,
+		State:      SessNone,
+		SeenMsgIDs: make(map[string]struct{}),
 	}
 }
 

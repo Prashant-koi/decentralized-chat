@@ -9,6 +9,32 @@ import (
 	"time"
 )
 
+type outbound struct {
+	queue   string
+	payload string
+}
+
+func appendOutboxEncrypted(st *runtimeState, c *Contact, sess *Session, toSend *[]outbound) {
+	for _, msg := range sess.Outbox {
+		ctr := sess.SendCtr
+		ct, err := encrypt(sess.SendKey, ctr, []byte(msg))
+		if err != nil {
+			continue
+		}
+		sess.SendCtr++
+		out := Envelope{
+			Kind:       "ct",
+			FromPub:    st.myPubB64,
+			Ctr:        ctr,
+			Body:       base64.StdEncoding.EncodeToString(ct),
+			ReplyQueue: c.RecvQueue,
+		}
+		b, _ := json.Marshal(out)
+		*toSend = append(*toSend, outbound{queue: c.SendQueue, payload: string(b)})
+	}
+	sess.Outbox = nil
+}
+
 func pollLoop(ctx context.Context, st *runtimeState) {
 	// this function runs in a loop and polls the server for new messages for each contact that has a receive queue,
 	// it also handles the incoming messages and sends acknowledgments to the server for the messages that have been successfully processed
@@ -75,10 +101,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 		return err
 	}
 
-	var toSend []struct {
-		queue   string
-		payload string
-	}
+	var toSend []outbound
 
 	st.mu.Lock()
 	c := st.contacts[alias]
@@ -86,22 +109,7 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 		c = &Contact{Alias: alias}
 		st.contacts[alias] = c
 	}
-	if env.FromPub != "" { // here we check the TOFU for inpersination
-		if c.TheirPubKey == "" {
-			c.TheirPubKey = env.FromPub
-			_ = saveContactsBook(st.contactsPath, st.contacts)
-			fmt.Printf("[TOFU] pinned %s to %s\n", alias, fingerprintPubKey(c.TheirPubKey))
-		} else if c.TheirPubKey != env.FromPub {
-			st.mu.Unlock()
-			return fmt.Errorf("TOFU mismatch!!")
-		}
-	}
-	if env.ReplyQueue != "" && c.SendQueue == "" {
-		c.SendQueue = env.ReplyQueue
-		_ = saveContactsBook(st.contactsPath, st.contacts)
-	}
 
-	// we check if there is a session if not then we start a new session
 	sess := st.sessions[alias]
 	if sess == nil {
 		sess = newSession()
@@ -110,80 +118,108 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 
 	switch env.Kind {
 	case "hs": // this is a handshake message that we receive from the peer to complete the handshake process
-		peerEph, err := base64.StdEncoding.DecodeString(env.Eph)
-		if err != nil {
-			st.mu.Unlock()
-			return err
-		}
-
-		responderStarted := false
-		if sess.State == SessNone {
-			if err := sess.startHandshake(); err != nil {
+		switch env.HSKind {
+		case "hs1": // this is the first handshake message that we receive from the peer, we need to verify the signature and the replay protection
+			if err := verifyHS1(st, alias, env, c, sess); err != nil {
 				st.mu.Unlock()
 				return err
 			}
-			responderStarted = true
-
-			replyEnv := Envelope{ // this is the handshake message that we send back to the peer to complete the handshake process if we are the responder
-				Kind:       "hs",
-				FromPub:    st.myPubB64,
-				Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
-				ReplyQueue: c.RecvQueue,
+			if env.ReplyQueue != "" && c.SendQueue == "" {
+				c.SendQueue = env.ReplyQueue
+				_ = saveContactsBook(st.contactsPath, st.contacts)
 			}
-			b, _ := json.Marshal(replyEnv)
-			toSend = append(toSend, struct {
-				queue   string
-				payload string
-			}{queue: c.SendQueue, payload: string(b)})
-		}
 
-		// if we recieve handshake we are the responder if we started handshake we are the initiator, this makes sure we derive the correct shared keys
-		initiator := !responderStarted && sess.State == SessWaiting
-		if err := sess.completeHandshake(peerEph, initiator); err != nil {
-			st.mu.Unlock()
-			return err
-		}
-
-		for _, msg := range sess.Outbox {
-			ctr := sess.SendCtr
-			ct, err := encrypt(sess.SendKey, ctr, []byte(msg))
+			peerEph, err := base64.StdEncoding.DecodeString(env.Eph)
 			if err != nil {
-				continue
+				st.mu.Unlock()
+				return err
 			}
-			sess.SendCtr++
-			out := Envelope{ // this is the ciphertext message that we send to the peer after the handshake is complete
-				Kind:       "ct",
-				FromPub:    st.myPubB64,
-				Ctr:        ctr,
-				Body:       base64.StdEncoding.EncodeToString(ct),
-				ReplyQueue: c.RecvQueue,
+
+			responderStarted := false
+			if sess.State == SessNone {
+				if err := sess.startHandshake(); err != nil {
+					st.mu.Unlock()
+					return err
+				}
+				responderStarted = true
 			}
-			b, _ := json.Marshal(out)
-			toSend = append(toSend, struct {
-				queue   string
-				payload string
-			}{queue: c.SendQueue, payload: string(b)})
-		}
-		sess.Outbox = nil
-	case "ct": // this is a ciphertext message that we receive from the peer and we need to decrypt it and print it to the terminal
-		if sess.State != SessReady {
+
+			initiator := !responderStarted && sess.State == SessWaiting
+			if err := sess.completeHandshake(peerEph, initiator); err != nil {
+				st.mu.Unlock()
+				return err
+			}
+			sess.Authenticated = true
+
+			if responderStarted {
+				hs2, err := buildHS2(st, sess, c.RecvQueue)
+				if err != nil {
+					st.mu.Unlock()
+					return err
+				}
+				b, _ := json.Marshal(hs2)
+				toSend = append(toSend, outbound{queue: c.SendQueue, payload: string(b)})
+			}
+
+			appendOutboxEncrypted(st, c, sess, &toSend)
+
+		case "hs2": // this is the second handshake message that we receive from the peer, we need to verify the signature and complete the handshake process
+			if err := verifyHS2(st, alias, env, c, sess); err != nil {
+				st.mu.Unlock()
+				return err
+			}
+			if env.ReplyQueue != "" && c.SendQueue == "" {
+				c.SendQueue = env.ReplyQueue
+				_ = saveContactsBook(st.contactsPath, st.contacts)
+			}
+
+			peerEph, err := base64.StdEncoding.DecodeString(env.Eph)
+			if err != nil {
+				st.mu.Unlock()
+				return err
+			}
+			if err := sess.completeHandshake(peerEph, true); err != nil {
+				st.mu.Unlock()
+				return err
+			}
+			sess.Authenticated = true
+			appendOutboxEncrypted(st, c, sess, &toSend)
+
+		default:
 			st.mu.Unlock()
-			return fmt.Errorf("cipher before ready session")
+			return fmt.Errorf("unknown handshake subtype")
 		}
+
+	case "ct": // this is a ciphertext message that we receive from the peer and we need to decrypt it and print it to the terminal
+		if sess.State != SessReady || !sess.Authenticated {
+			st.mu.Unlock()
+			return fmt.Errorf("cipher before authenticated session")
+		}
+		if c.TheirPubKey != "" && env.FromPub != "" && env.FromPub != c.TheirPubKey {
+			st.mu.Unlock()
+			return fmt.Errorf("cipher from unexpected identity key")
+		}
+
 		ct, err := base64.StdEncoding.DecodeString(env.Body)
 		if err != nil {
 			st.mu.Unlock()
 			return err
+		}
+		if env.Ctr < sess.RecvCtr {
+			st.mu.Unlock()
+			return fmt.Errorf("replayed/out-of-order counter")
 		}
 		pt, err := decrypt(sess.RecvKey, env.Ctr, ct)
 		if err != nil {
 			st.mu.Unlock()
 			return err
 		}
-		if env.Ctr >= sess.RecvCtr {
-			sess.RecvCtr = env.Ctr + 1
-		}
+		sess.RecvCtr = env.Ctr + 1
 		fmt.Printf("[%s] %s\n", alias, string(pt))
+
+	default:
+		st.mu.Unlock()
+		return fmt.Errorf("unknown envelope kind")
 	}
 	st.mu.Unlock()
 
@@ -194,5 +230,4 @@ func handleEnvelope(st *runtimeState, alias, payload string) error {
 		_ = relayPut(st.addr, s.queue, s.payload)
 	}
 	return nil
-
 }

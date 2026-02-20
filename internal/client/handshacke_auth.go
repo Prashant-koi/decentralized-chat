@@ -79,7 +79,7 @@ func buildHS1(st *runtimeState, sess *Session, replyQueue string) (Envelope, err
 func buildHS2(st *runtimeState, sess *Session, replyQueue string) (Envelope, error) {
 	env := Envelope{
 		Kind:       "hs",
-		HSKind:     "hs1",
+		HSKind:     "hs2",
 		FromPub:    st.myPubB64,
 		Eph:        base64.StdEncoding.EncodeToString(sess.MyEphPub),
 		ReplyQueue: replyQueue,
